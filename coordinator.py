@@ -1,86 +1,93 @@
 """
-FastAPI Coordinator — Asynchronous Multi-Agent Orchestrator
-Executes Memory, Calendar, and Slack MCP Workers in parallel with AsyncIO.
-Target Latency: < 9.5 seconds end-to-end.
+coordinator.py - Orchestrator Agent.
+Coordinates calendar, memory, and notification micro-agents concurrently via AsyncIO.
+Exposes FastAPI interface and direct CLI test runner.
 """
 
 import asyncio
-import time
+import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from calendar_agent import CalendarAgent
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+import uvicorn
 
-app = FastAPI(title="Nexos Multi-Agent Coordinator", version="1.0.0")
+app = FastAPI(
+    title="Coordinator Agent Orchestrator",
+    description="Multi-agent orchestrator utilizing asyncio and MCP micro-agents.",
+    version="1.0.0"
+)
 
-class MissionRequest(BaseModel):
-    client_name: str
-    proposed_time: str
-    topic: str
+WORKER_URLS = {
+    "calendar": "http://127.0.0.1:8001",
+    "memory": "http://127.0.0.1:8002",
+    "slack": "http://127.0.0.1:8003"
+}
 
-# Mock workers simulating MCP socket calls
-async def mcp_query_memory(client_name: str) -> dict:
-    """Worker 1: Queries long-term contextual memory store."""
-    await asyncio.sleep(2.4) # Simulates vector/graph memory lookup
-    return {
-        "client": client_name,
-        "relationship_tier": "Enterprise Tier-1",
-        "preferences": ["Direct technical briefings", "Prefers Slack notifications over email"],
-        "last_interaction": "2026-11-02"
-    }
+class PipelineTaskRequest(BaseModel):
+    session_id: str = Field(default="demo-session-001")
+    event_title: str = Field(..., description="Title of the meeting")
+    start_time: str = Field(..., description="ISO 8601 start time (e.g. 2026-11-15T15:00:00)")
+    timezone_str: str = Field(default="America/New_York", description="User's local IANA timezone")
+    slack_channel: str = Field(default="#ai-ops")
 
-async def mcp_reserve_calendar(client_name: str, proposed_time: str) -> dict:
-    """Worker 2: Resolves conflicts and books with ZoneInfo fix."""
-    agent = CalendarAgent(default_tz="America/New_York")
-    await asyncio.sleep(3.1) # Simulates Google Calendar API MCP negotiation
-    return await agent.schedule_meeting(
-        summary=f"Technical Architecture Review — {client_name}",
-        naive_or_iso_str=proposed_time,
-        duration=45
-    )
+async def call_worker(client: httpx.AsyncClient, name: str, endpoint: str, payload: dict) -> Dict[str, Any]:
+    url = f"{WORKER_URLS[name]}{endpoint}"
+    try:
+        response = await client.post(url, json=payload, timeout=5.0)
+        response.raise_for_status()
+        return {"worker": name, "success": True, "data": response.json()}
+    except Exception as e:
+        return {"worker": name, "success": False, "error": str(e)}
 
-async def mcp_dispatch_slack(channel: str, message: str) -> dict:
-    """Worker 3: Formats and sends final executive brief to Slack."""
-    await asyncio.sleep(1.8) # Simulates Slack Webhook dispatch
-    return {
-        "status": "delivered",
-        "channel": channel,
-        "ts": "1731632400.109"
-    }
+@app.post("/execute_workflow")
+async def execute_workflow(req: PipelineTaskRequest):
+    """
+    Executes a resilient 3-step multi-agent pipeline:
+    1. Schedule calendar event with exact timezone normalization.
+    2. Store event metadata into session memory.
+    3. Dispatch confirmation notification to Slack.
+    Uses asyncio.gather for concurrent execution where appropriate.
+    """
+    async with httpx.AsyncClient() as client:
+        # Step 1: Calendar scheduling
+        cal_res = await call_worker(client, "calendar", "/schedule", {
+            "title": req.event_title,
+            "start_time": req.start_time,
+            "timezone_str": req.timezone_str,
+            "duration_minutes": 45
+        })
 
-@app.post("/api/v1/coordinate")
-async def coordinate_multi_agent_pipeline(mission: MissionRequest):
-    start_time = time.perf_counter()
+        if not cal_res["success"]:
+            raise HTTPException(status_code=502, detail=f"Calendar worker failed: {cal_res.get('error')}")
 
-    # Step 1: Execute Memory and Calendar Workers concurrently
-    memory_task = mcp_query_memory(mission.client_name)
-    calendar_task = mcp_reserve_calendar(mission.client_name, mission.proposed_time)
+        event_data = cal_res["data"]["event"]
 
-    # Concurrency via asyncio.gather
-    memory_res, calendar_res = await asyncio.gather(memory_task, calendar_task)
+        # Step 2 & 3: Run Memory and Slack notifications concurrently via asyncio.gather
+        memory_payload = {
+            "session_id": req.session_id,
+            "key": "last_scheduled_meeting",
+            "content": f"Meeting '{req.event_title}' booked for {event_data['utc_start']}",
+            "metadata": event_data
+        }
+        slack_payload = {
+            "channel": req.slack_channel,
+            "text": f"✅ Multi-Agent Orchestrator: Event '{req.event_title}' confirmed for {event_data['local_start']} ({req.timezone_str})",
+            "priority": "normal"
+        }
 
-    # Step 2: Format executive brief using memory context
-    brief = (
-        f":zap: *Executive Briefing Scheduled*\n"
-        f"• *Client:* {mission.client_name} ({memory_res['relationship_tier']})\n"
-        f"• *Topic:* {mission.topic}\n"
-        f"• *Meeting Slot:* `{calendar_res['start']}` ({calendar_res['timezone']})\n"
-        f"• *Context:* {memory_res['preferences'][0]}"
-    )
+        memory_res, slack_res = await asyncio.gather(
+            call_worker(client, "memory", "/store", memory_payload),
+            call_worker(client, "slack", "/send", slack_payload)
+        )
 
-    # Step 3: Broadcast dispatch to Slack
-    slack_res = await mcp_dispatch_slack(channel="#engineering-briefs", message=brief)
-
-    total_duration = round(time.perf_counter() - start_time, 2)
-
-    return {
-        "status": "completed",
-        "execution_time_seconds": total_duration,
-        "memory_result": memory_res,
-        "calendar_result": calendar_res,
-        "slack_result": slack_res,
-        "system_status": "ONLINE"
-    }
+        return {
+            "status": "completed",
+            "pipeline_summary": {
+                "calendar": cal_res,
+                "memory": memory_res,
+                "slack": slack_res
+            }
+        }
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run("coordinator:app", host="127.0.0.1", port=8000, reload=False)

@@ -1,24 +1,24 @@
 {
   "mcpServers": {
-    "memory": {
+    "calendar_worker": {
       "command": "python",
-      "args": ["-m", "mcp_server_memory"],
+      "args": ["workers/calendar_worker.py"],
       "env": {
-        "MEMORY_STORE_PATH": "./data/memory_store.json"
+        "PORT": "8001"
       }
     },
-    "google-calendar": {
+    "memory_worker": {
       "command": "python",
-      "args": ["-m", "mcp_server_gcalendar"],
+      "args": ["workers/memory_worker.py"],
       "env": {
-        "CALENDAR_DEFAULT_TIMEZONE": "America/New_York"
+        "PORT": "8002"
       }
     },
-    "slack": {
+    "slack_worker": {
       "command": "python",
-      "args": ["-m", "mcp_server_slack"],
+      "args": ["workers/slack_worker.py"],
       "env": {
-        "SLACK_CHANNEL": "#engineering-briefs"
+        "PORT": "8003"
       }
     }
   }
